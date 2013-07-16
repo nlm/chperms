@@ -1,0 +1,481 @@
+#!/usr/bin/perl -w
+# Permutil
+# $Id: chperms 122 2013-05-27 13:18:34Z nlimage $
+use strict;
+use warnings;
+use Fcntl ':mode';
+use File::FnMatch qw(:fnmatch);
+use Getopt::Long qw{:config bundling no_ignore_case no_auto_abbrev};
+use Data::Dumper;
+
+#######################################################
+
+sub usage
+{
+	print("usage: $0 [OPTIONS] FILE.PERMS DIR [DIR ...]\n");
+	print("\n    Options:\n");
+	print("      -h --help             show this help\n");
+	print("      -v --verbose          be verbose (can be repeated)\n");
+	print("      -n --dryrun           tell what would have been done,\n");
+	print("                            but doesn't actually do anything\n");
+}
+
+#######################################################
+# GLOBALS
+
+my %opt_defines;
+my $opt_dryrun = 0;
+my $opt_verbose = 0;
+
+#######################################################
+# UID/GID RESOLUTION (+CACHE)
+
+my $CACHE = { user => {}, group => {} };
+
+sub getuid
+{
+	my $name = shift or die;
+
+	return $CACHE->{user}->{$name} if (exists($CACHE->{user}->{$name}));
+	my $uid = getpwnam($name);
+	return undef if ($uid !~ /^\d+$/);
+	$CACHE->{user}->{$name} = $uid;
+	return $uid;
+}
+
+sub getgid
+{
+	my $name = shift or die;
+
+	return $CACHE->{group}->{$name} if (exists($CACHE->{group}->{$name}));
+	my $gid = getgrnam($name);
+	return undef if (!defined($gid) || $gid !~ /^\d+$/);
+	$CACHE->{group}->{$name} = $gid;
+	return $gid;
+}
+
+#######################################################
+
+sub parse_rules
+{
+	my $fd = shift or die;
+	my $rules = {};
+	my @dirstack = ();
+	my $indent = -1;
+
+	while (<$fd>)
+	{
+		chomp;
+		if (/^(#|\s*$)/)
+		{
+		}
+		elsif (/^(\t*)(\S+)\s*(((([fd]:[0-9]{3,4}[-+=]?)|([ug]:[A-Za-z0-9_-]+))\s*)*)$/)
+		{
+			#######################################################
+			# PARSE ATTRIBUTES
+
+			my $attrs;
+			foreach my $elt (split(/\s+/, $3, 0))
+			{
+				my @tab = split(/:/, $elt);
+				$attrs->{$tab[0]} = $tab[1];
+			}
+
+			#######################################################
+			# PARSE PATH
+
+			my $newindent = length($1);
+			my $inddiff = $newindent - $indent;
+
+			(my $path = $2) =~ s/\/+/\//g;
+			die "indent error: $_" if ($inddiff > 1);
+
+			if ($inddiff <= 0) { for (my $i = $inddiff; $i <= 0; $i++) { pop @dirstack; }  }
+			push @dirstack, $path;
+
+			printf "PARSE: %s -> [%s]\n", $path, join(':', join(',', %$attrs)) if ($opt_verbose >= 3);
+
+			$rules->{join('/', @dirstack)} = $attrs;
+			$indent = $newindent;
+		}
+		else
+		{
+			print "err: $_\n";
+			return undef;
+		}
+	}
+
+	return $rules;
+}
+
+sub cmppat($$)
+{
+	my $a =()= $_[0] =~ /\//g;
+	my $b =()= $_[1] =~ /\//g;
+	my $r = ($a <=> $b);
+	return $r if $r != 0;
+	return -(($_[0] =~ m/\*/) <=> ($_[1] =~ m/\*/)) if ($_[0] =~ m/\*/ || $_[1] =~ m/\*/);
+	return length($_[0]) <=> length($_[1]);
+}
+
+sub get_path_rules
+{
+	my $rules = shift or die;
+	my $path = shift or die;
+	my $filerules = {};
+
+	$path =~ s/\/+/\//g;
+	#######################################################
+	# FNMATCH
+
+	my $ruleslist;
+
+	if (exists($CACHE->{ruleslist}))
+	{
+		$ruleslist = $CACHE->{ruleslist};
+	}
+	else
+	{
+		$ruleslist = [ sort cmppat keys %$rules ];
+		$CACHE->{ruleslist} = $ruleslist;
+	}
+
+	printf("%s\nCHECK: %s\n", '*' x 80, $path) if ($opt_verbose >= 3);
+
+	foreach my $pat (@$ruleslist)
+	{
+		if (fnmatch($pat, $path))
+		{
+			print("RULE MATCH: $pat\n") if ($opt_verbose >= 3);
+			foreach my $key (keys %{$rules->{$pat}})
+			{
+				$filerules->{$key} = $rules->{$pat}->{$key};
+			}
+		}
+	}
+
+	if ($opt_verbose >= 3)
+	{
+		foreach (keys %$filerules)
+		{
+			printf("FINAL RULE: %s:%s\n", $_, $filerules->{$_});
+		}
+		
+	}
+
+	return $filerules;
+}
+
+sub apply_rules
+{
+	my $rules = shift or die;
+	my $fname = shift;
+	my $err = 0;
+
+	die if !-e $fname;
+	my @stats = stat(_);
+
+	#######################################################
+	# USER AND GROUP
+
+	if (defined($rules->{u}) or defined($rules->{g}))
+	{
+		my $uid = $stats[4];
+		my $gid = $stats[5];
+
+		if (defined($rules->{u}))
+		{
+			if ($rules->{u} =~ /^(\d+)$/)
+			{
+				$uid = $1;
+			}
+			else
+			{
+				if (!defined($uid = getuid($rules->{u})))
+				{
+					warn "unknown user $rules->{u}\n";
+					$err++;
+				}
+			}
+		}
+
+		if (defined($rules->{g}))
+		{
+			if ($rules->{g} =~ /^(\d+)$/)
+			{
+				$gid = $1;
+			}
+			else
+			{
+				if (!defined($gid = getgid($rules->{g})))
+				{
+					warn "unknown group $rules->{g}\n";
+					$err++;
+				}
+			}
+		}
+
+		if (defined($uid) && defined($gid) && ($stats[4] != $uid or $stats[5] != $gid))
+		{
+			printf("CHANGE OWNER: %s/%s -> %s/%s\n", $stats[4], $stats[5], $uid, $gid) if ($opt_verbose >= 3);
+
+			if ($opt_dryrun)
+			{
+				printf("chown %d:%d %s\n", $uid, $gid, $fname) if (!$opt_verbose);
+			}
+			elsif (!chown($uid, $gid, $fname))
+			{
+				warn "chown($uid:$gid,$fname): $!\n";
+				$err++;
+			}
+		}
+	}
+
+	#######################################################
+	# FILE AND DIRECTORY MODES
+
+	my ($mode, $type);
+
+	if (S_ISDIR($stats[2]) and defined($rules->{d}))
+	{
+		die if (!($rules->{d} =~ /^(\d+)([-+=]*)$/));
+		($mode, $type) = ($1, $2);
+	}
+	elsif (defined($rules->{f}))
+	{
+		die if (!($rules->{f} =~ /^(\d+)([-+=]*)$/));
+		($mode, $type) = ($1, $2);
+	}
+
+	if (defined($mode))
+	{
+		my $cmode = S_IMODE($stats[2]);
+		if (oct($mode) != $cmode)
+		{
+			printf("CHANGE MODE: %o -> %o\n", $cmode, oct($mode)) if ($opt_verbose >= 3);
+
+			if ($opt_dryrun)
+			{
+				printf("chmod %o %s\n", oct($mode), $fname) if (!$opt_verbose);
+			}
+			elsif (!chmod(oct($mode), $fname))
+			{
+				warn "fail to chmod $fname: $!\n";
+				$err++;
+			}
+		}
+	}
+
+	return $err;
+}
+
+sub parse_tree
+{
+	my $rules = shift or die;
+	my $basedir = shift;
+	my @dirstack = ();
+	my @dirnamestack = ();
+	my $dh;
+	my $err = 0;
+
+	if (!opendir($dh, $basedir))
+	{
+		warn "opendir($basedir): $!";
+		return 1;
+	}
+	unshift @dirstack, $dh;
+
+	#####
+	# Corner case: local root path
+
+	if (!chdir($dirstack[0]))
+	{
+		warn "chdir(): $!\n";
+		$err++;
+		shift @dirstack;
+		next;
+	}
+
+	if (my $rule = get_path_rules($rules, '.'))
+	{
+		$err += apply_rules($rule, '.');
+	}
+
+	#####
+
+	while (@dirstack && @dirstack < 128)
+	{
+		if (!chdir($dirstack[0]))
+		{
+			warn "chdir(): $!\n";
+			$err++;
+			shift @dirstack;
+			next;
+		}
+
+		while (my $fname = readdir($dirstack[0]))
+		{
+			next if ($fname eq '.' or $fname eq '..');
+			next unless -e $fname;
+
+			my $path = join('/', (@dirnamestack, $fname));
+			if (my $rule = get_path_rules($rules, $path))
+			{
+				$err += apply_rules($rule, $fname);
+			}
+
+			if (-d $fname)
+			{
+				my $ndh;
+
+				if (!opendir($ndh, $fname))
+				{
+					warn "opendir($fname): $!";
+					$err++;
+					next;
+				}
+
+				if (!chdir($ndh))
+				{
+					warn "chdir($fname): $!\n";
+					$err++;
+					closedir($ndh);
+					next;
+				}
+
+				unshift(@dirstack, $ndh);
+				push(@dirnamestack, $fname);
+			}
+		}
+
+		closedir($dirstack[0]);
+		shift(@dirstack);
+		pop(@dirnamestack);
+	}
+}
+
+if (!GetOptions (
+	"d|define=s%" => \%opt_defines,
+	"n|dryrun" => \$opt_dryrun,
+	"v|verbose+" => \$opt_verbose,
+)) { usage(); exit(1); }
+
+if (@ARGV < 2)
+{
+	usage(); exit(1);
+}
+
+###############################################################################
+# PARSE RULES
+
+my $perms_file = shift @ARGV;
+my $fd;
+
+-f $perms_file or die "$perms_file: not a regular file\n";
+open($fd, '<', $perms_file) or die "unable to open $perms_file: $!\n";
+my $rules = parse_rules($fd) or die "unable to parse config\n";
+close($fd);
+
+###############################################################################
+# PARSE TREE
+my $err = 0;
+my $dh;
+
+opendir($dh, '.') or die "opendir('.'): $!\n";
+
+foreach (@ARGV)
+{
+	$err += parse_tree($rules, $_);
+	chdir($dh);
+}
+
+closedir($dh);
+exit(!$err);
+
+__END__
+
+=head1 NAME
+
+chperms - massively change file and directory owner and modes
+
+=head1 SYNOPSIS
+
+chperms [OPTIONS] <RULE FILE> <DIR [DIR ..]>
+
+=head1 DESCRIPTION
+
+This tool changes owner/group and modes in a directory tree, according to a rule file.
+
+=head1 OPTIONS
+
+-h --help               show the help
+
+-v --verbose            be verbose (can be repeated)
+
+-n --dryrun             tell what would have been done,
+                        but doesn't actually do anything
+
+=head1 RULES FILE SYNTAX
+
+A rules file describes the owner, group, and modes of file and directories. It is composed of multiple line, each describing a rule.
+A rule begins by a filename or fnmatch()-compatible pattern, and is followed by zero or more rule specs. A rule spec is
+of the form <type>:<arg>. The different types are :
+
+=over 4
+
+=item u
+
+User specifier. Takes a valid system user name as argument. Tells who will be the owner of the file or directory.
+
+=item g
+
+Group specifier. Takes a valid system group name as argument. Tells who will be the group of the file or directory.
+
+=item f
+
+File mode specifier. Takes a valid mode as argument (ex: 644). Tells which modes should be applied to matching files.
+
+=item d
+
+Directory mode specifier. Takes a valid mode as argument (ex: 755). Tells which modes should be applied to matching directories.
+
+=back
+
+To simplify the syntax, you can begin a line with one or more TAB characters (\t).
+The line will be considered as a subdir of the last described directory.
+A line must not have more than 1 more TAB than the previous one.
+
+=head2 Example
+
+    usr f:644 d:755\nbin
+        bin/* f:755
+
+=head1 EXAMPLES
+
+The following line tells that everyting under the chosen directory tree will have 'root' as owned, 'root' as group,
+that files will be set at mode 644 and directories at mode 755 :
+
+    * f:644 d:755 u:root g:root
+
+The following line tells that all files under the 'bin' subdirectory and with the '.sh' extension will have their mode set to 755.
+(All other files will inherit from the less-specific matching rules, if any).
+
+    bin/*.sh f:755
+
+The following line tells that the 'images' subdirectory will have mode 755. It does not contain a pattern, so permissions will not be propageted to its content.
+
+images f:644 d:755
+
+=head1 EXIT VALUES
+
+The program will exit with a non-zero value if it encountered errors.
+Else, it will exit with status 0.
+
+=head1 AUTHOR
+
+Nicolas Limage <nicolas@xephon.org>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2013 Nicolas Limage. All rights reserved.  This program is free software; you can redistribute it
+and/or modify it under the same terms as Perl itself.

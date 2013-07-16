@@ -1,0 +1,8 @@
+* f:644 d:755 u:root g:root
+. d:100
+bin/*.sh f:755
+bin/..sh f:644
+bin/%.sh f:644
+text/* f:644
+images/*.jpg f:644
+upload d:775 u:root g:www-data
